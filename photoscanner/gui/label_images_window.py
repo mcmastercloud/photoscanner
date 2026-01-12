@@ -178,6 +178,10 @@ class ImagePreview(QLabel):
         self._show_all = True
         self.update()
     
+    def set_show_all_boxes(self, show: bool):
+        self._show_all = show
+        self.update()
+
     def clear_all_mode(self):
         self._show_all = False
         self.update()
@@ -394,6 +398,7 @@ class LabelImagesWindow(QWidget):
         self._btn_suggest = QPushButton("Suggest Labels (AI)")
         self._btn_view_xmp = QPushButton("View XMP")
         self._chk_show_all = QCheckBox("Show all boxes")
+        self._chk_show_all.setChecked(self._settings.value("show_all_boxes", False, type=bool))
         
         self._progress = QProgressBar()
         self._progress.setVisible(False)
@@ -445,9 +450,19 @@ class LabelImagesWindow(QWidget):
         
         # Notification Label
         self._lbl_notification = QLabel("")
-        self._lbl_notification.setStyleSheet("QLabel { background-color: #333; color: white; padding: 5px; border-radius: 4px; }")
+        self._lbl_notification.setStyleSheet("""
+            QLabel { 
+                background-color: #333; 
+                color: white; 
+                padding: 4px 8px; 
+                border-radius: 4px;
+                font-size: 12px;
+            }
+        """)
         self._lbl_notification.setVisible(False)
         self._lbl_notification.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_notification.setFixedHeight(28) # Ensure it stays short/compact
+        
         main_layout.addWidget(self._lbl_notification)
         
         self.setLayout(main_layout)
@@ -458,8 +473,11 @@ class LabelImagesWindow(QWidget):
         self._btn_suggest.clicked.connect(self._on_suggest)
         self._btn_view_xmp.clicked.connect(self._on_view_xmp)
         self._btn_save_labels.clicked.connect(self._on_save)
-
         self._chk_show_all.toggled.connect(self._on_show_all_toggled)
+
+        # Check AI coverage on load
+        self._lbl_preview.set_show_all_boxes(self._chk_show_all.isChecked())
+
         # Check AI
         avail = get_ai_availability()
         if not avail.embeddings:
@@ -869,6 +887,7 @@ class LabelImagesWindow(QWidget):
             self._lbl_preview.set_bbox(None)
 
     def _on_show_all_toggled(self, checked: bool):
+        self._settings.setValue("show_all_boxes", checked)
         if checked:
             self._update_show_all()
         else:
@@ -950,6 +969,11 @@ class LabelImagesWindow(QWidget):
         self._labeler.error.connect(self._on_label_error)
         self._labeler.start()
 
+    def _show_notification(self, message: str, duration: int = 3000):
+        self._lbl_notification.setText(message)
+        self._lbl_notification.setVisible(True)
+        QTimer.singleShot(duration, lambda: self._lbl_notification.setVisible(False))
+
     def _on_labels_ready(self, objects: list[dict], error_msg: str):
         self._btn_suggest.setEnabled(True)
         self._btn_suggest.setText("Suggest Labels (AI)")
@@ -959,7 +983,7 @@ class LabelImagesWindow(QWidget):
             QMessageBox.warning(self, "AI Warning", error_msg)
             return
         elif not objects:
-            QMessageBox.information(self, "AI", "No objects detected.")
+            self._show_notification("No objects detected.")
             return
         
         # Deduplicate Logic
@@ -1021,9 +1045,9 @@ class LabelImagesWindow(QWidget):
         self._refresh_labels_ui()
         
         if added_count == 0:
-            self._lbl_notification.setText("No new labels found.")
-            self._lbl_notification.setVisible(True)
-            QTimer.singleShot(3000, lambda: self._lbl_notification.setVisible(False))
+            self._show_notification("No new labels found.")
+        else:
+            self._show_notification(f"Added {added_count} labels.", duration=2000)
 
     def _on_label_error(self, msg: str):
         self._btn_suggest.setEnabled(True)
@@ -1080,9 +1104,9 @@ class LabelImagesWindow(QWidget):
         # Write XMP
         try:
             self._write_xmp(self._current_image, self._current_labels)
-            QMessageBox.information(self, "Saved", "Labels saved to database and XMP.")
+            self._show_notification("Labels saved to XMP and Database.", duration=3000)
         except ImportError:
-            QMessageBox.information(self, "Saved", "Labels saved to database.\n(Install 'pyexiv2' to enable XMP writing)")
+            self._show_notification("Labels saved to DB (Install pyexiv2 for XMP).", duration=4000)
         except Exception as e:
             QMessageBox.warning(self, "XMP Error", f"Saved to DB, but failed to write XMP: {e}")
 
@@ -1102,177 +1126,178 @@ class LabelImagesWindow(QWidget):
             'stReg': "http://ns.adobe.com/xmp/sType/Region#"
         }
 
-        # Register namespaces globally for pyexiv2
-        try:
-            for prefix, uri in NS_MAP.items():
-                pyexiv2.registerNs(uri, prefix)
-        except Exception:
-            pass
-
-        # Extract unique labels
-        labels = sorted(list(set(o["label"] for o in objects)))
-        
-        # Filter objects with bounding boxes for Regions
-        region_objects = [o for o in objects if o.get("bbox")]
-
-        with pyexiv2.Image(str(path)) as img:
-            # Get Image Dimensions for mwg-rs:AppliedToDimensions
-            # Try getting from EXIF or guess (pyexiv2 might not yield easy w/h directly from XMP object)
-            # but we can rely on our UI's preview or skip dimensions if strictly necessary.
-            # However, the user example includes it, and it's good practice for MWG.
-            # We already loaded QPixmap for this image in UI, but we are in a method that takes path.
-            # Let's verify if we can get it from PIL quickly.
-            
-            img_w, img_h = 0, 0
+        # Register namespaces globally for ET
+        for prefix, uri in NS_MAP.items():
+            ET.register_namespace(prefix, uri)
             try:
-                # pyexiv2 provides pixelWidth/Height? accessors?
-                # Using PIL is safer for dimensions if accessible.
-                from PIL import Image
-                with Image.open(path) as pil_img:
-                    img_w, img_h = pil_img.size
+                pyexiv2.registerNs(uri, prefix)
             except:
                 pass
 
+        # Extract unique labels
+        labels = sorted(list(set(o["label"] for o in objects)))
+        region_objects = [o for o in objects if o.get("bbox")]
+
+        with pyexiv2.Image(str(path)) as img:
+            img_w, img_h = 0, 0
+            try:
+               w = img.get_pixelWidth()
+               h = img.get_pixelHeight()
+               if w and h:
+                   img_w, img_h = int(w), int(h)
+            except:
+                pass
+            
+            # Fallback to PIL
+            if img_w == 0:
+                try:
+                    from PIL import Image
+                    with Image.open(path) as pil_img:
+                        img_w, img_h = pil_img.size
+                except:
+                    pass
+
             raw_xmp = img.read_raw_xmp()
             
-            # Create basic skeleton if missing
-            if not raw_xmp:
-                raw_xmp = """<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.6.0">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-    xmlns:dc="http://purl.org/dc/elements/1.1/"
-    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
-    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
-    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
-    xmlns:stReg="http://ns.adobe.com/xmp/sType/Region#">
-  </rdf:Description>
- </rdf:RDF>
-</x:xmpmeta>"""
+            # Smart parsing that handles xpacket wrapper
+            root = None
+            if raw_xmp:
+                # Strip xpacket wrapper if present to avoid ET issues
+                start = raw_xmp.find('<x:xmpmeta')
+                end = raw_xmp.rfind('</x:xmpmeta>')
+                if start != -1 and end != -1:
+                    raw_xml_body = raw_xmp[start:end+12]
+                    try:
+                        root = ET.fromstring(raw_xml_body)
+                    except ET.ParseError:
+                        pass
+            
+            if root is None:
+                # Create fresh
+                root = ET.Element(f"{{{NS_MAP['x']}}}xmpmeta")
+                root.set(f"{{{NS_MAP['x']}}}xmptk", "XMP Core 5.6.0")
 
-            # Register namespaces for ET
-            for prefix, uri in NS_MAP.items():
-                ET.register_namespace(prefix, uri)
-                
-            try:
-                root = ET.fromstring(raw_xmp)
-                rdf = root.find('rdf:RDF', NS_MAP)
-                if rdf is None:
-                    # Try locally scoped finding without namespace logic if needed
-                    rdf = root.find('{http://www.w3.org/1999/02/22-rdf-syntax-ns#}RDF')
-                
-                if rdf is None:
-                    rdf = ET.SubElement(root, f"{{{NS_MAP['rdf']}}}RDF")
+            # Ensure RDF
+            rdf = root.find('rdf:RDF', NS_MAP)
+            if rdf is None:
+                # Try finding without prefix if namespace map failed to match
+                for child in root:
+                    if child.tag.endswith("RDF"):
+                        rdf = child
+                        break
+            
+            if rdf is None:
+                rdf = ET.SubElement(root, f"{{{NS_MAP['rdf']}}}RDF")
 
-                # Find Description
-                desc = None
-                for d in rdf.findall('rdf:Description', NS_MAP):
+            # Ensure Description
+            desc = None
+            for d in rdf.findall('rdf:Description', NS_MAP):
+                if d.get(f"{{{NS_MAP['rdf']}}}about") == "":
                     desc = d
                     break
-                
-                if desc is None:
+            
+            if desc is None:
+                if len(rdf) > 0:
+                     desc = rdf[0]
+                else:
                     desc = ET.SubElement(rdf, f"{{{NS_MAP['rdf']}}}Description")
                     desc.set(f"{{{NS_MAP['rdf']}}}about", "")
 
-                # 1. Update Keywords (dc:subject)
-                subject = desc.find('dc:subject', NS_MAP)
-                if subject is not None:
-                    desc.remove(subject)
-                
-                if labels:
-                    subject = ET.SubElement(desc, f"{{{NS_MAP['dc']}}}subject")
-                    bag = ET.SubElement(subject, f"{{{NS_MAP['rdf']}}}Bag")
-                    for label in labels:
-                        li = ET.SubElement(bag, f"{{{NS_MAP['rdf']}}}li")
-                        li.text = label
+            # --- UPDATE CONTENT ---
 
-                # 2. Update Image Regions (mwg-rs:Regions) - REMOVE OLD Extension logic if present
-                # Remove Iptc4xmpExt logic if it exists (cleanup)
-                old_ns = "http://iptc.org/std/Iptc4xmpExt/2008-02-29/"
-                old_regions = desc.find(f"{{{old_ns}}}ImageRegion")
-                if old_regions is not None:
-                    desc.remove(old_regions)
+            # 1. dc:subject (Keywords)
+            subject = desc.find('dc:subject', NS_MAP)
+            if subject is not None:
+                desc.remove(subject)
+            
+            if labels:
+                subject = ET.SubElement(desc, f"{{{NS_MAP['dc']}}}subject")
+                bag = ET.SubElement(subject, f"{{{NS_MAP['rdf']}}}Bag")
+                for label in labels:
+                    li = ET.SubElement(bag, f"{{{NS_MAP['rdf']}}}li")
+                    li.text = label
+
+            # 2. mwg-rs:Regions
+            # Clean old regions
+            for tag in [f"{{{NS_MAP['mwg-rs']}}}Regions", "{http://iptc.org/std/Iptc4xmpExt/2008-02-29/}ImageRegion"]:
+                found = desc.find(tag, NS_MAP) if 'mwg-rs' in tag else None
+                if found is None and 'iptc' in tag.lower():
+                     for child in desc:
+                         if 'ImageRegion' in child.tag:
+                             desc.remove(child)
+                if found is not None:
+                    desc.remove(found)
+            
+            mwg_regions = desc.find('mwg-rs:Regions', NS_MAP)
+            if mwg_regions is not None:
+                desc.remove(mwg_regions)
+
+            if region_objects:
+                regions = ET.SubElement(desc, f"{{{NS_MAP['mwg-rs']}}}Regions")
+                regions.set(f"{{{NS_MAP['rdf']}}}parseType", "Resource")
+
+                # AppliedToDimensions
+                if img_w > 0 and img_h > 0:
+                    dims = ET.SubElement(regions, f"{{{NS_MAP['mwg-rs']}}}AppliedToDimensions")
+                    # Use attributes for dimensions
+                    dims.set(f"{{{NS_MAP['stDim']}}}w", str(img_w))
+                    dims.set(f"{{{NS_MAP['stDim']}}}h", str(img_h))
+                    dims.set(f"{{{NS_MAP['stDim']}}}unit", "pixel")
+
+                # RegionList
+                rlist = ET.SubElement(regions, f"{{{NS_MAP['mwg-rs']}}}RegionList")
+                bag = ET.SubElement(rlist, f"{{{NS_MAP['rdf']}}}Bag")
                 
-                regions = desc.find('mwg-rs:Regions', NS_MAP)
-                if regions is not None:
-                    desc.remove(regions)
-                
-                if region_objects:
-                    regions = ET.SubElement(desc, f"{{{NS_MAP['mwg-rs']}}}Regions")
-                    regions.set(f"{{{NS_MAP['rdf']}}}parseType", "Resource")
+                for obj in region_objects:
+                    li = ET.SubElement(bag, f"{{{NS_MAP['rdf']}}}li")
+                    # Use nested rdf:Description with attributes
+                    struct = ET.SubElement(li, f"{{{NS_MAP['rdf']}}}Description")
                     
-                    # AppliedToDimensions
-                    if img_w > 0 and img_h > 0:
-                        dims = ET.SubElement(regions, f"{{{NS_MAP['mwg-rs']}}}AppliedToDimensions")
-                        dims.set(f"{{{NS_MAP['rdf']}}}parseType", "Resource")
-                        
-                        w_el = ET.SubElement(dims, f"{{{NS_MAP['stDim']}}}w")
-                        w_el.text = str(img_w)
-                        h_el = ET.SubElement(dims, f"{{{NS_MAP['stDim']}}}h")
-                        h_el.text = str(img_h)
-                        unit_el = ET.SubElement(dims, f"{{{NS_MAP['stDim']}}}unit")
-                        unit_el.text = "pixel"
+                    # stReg:Name and Type as attributes of Description
+                    struct.set(f"{{{NS_MAP['stReg']}}}Name", obj["label"])
+                    struct.set(f"{{{NS_MAP['stReg']}}}Type", "Face")
 
-                    # RegionList
-                    rlist = ET.SubElement(regions, f"{{{NS_MAP['mwg-rs']}}}RegionList")
-                    bag = ET.SubElement(rlist, f"{{{NS_MAP['rdf']}}}Bag")
+                    # stReg:Area as property with attributes
+                    bbox = obj["bbox"]
+                    area = ET.SubElement(struct, f"{{{NS_MAP['stReg']}}}Area")
                     
-                    for obj in region_objects:
-                        li = ET.SubElement(bag, f"{{{NS_MAP['rdf']}}}li")
-                        li.set(f"{{{NS_MAP['rdf']}}}parseType", "Resource")
-                        
-                        # stReg:Name (Label)
-                        name_el = ET.SubElement(li, f"{{{NS_MAP['stReg']}}}Name")
-                        name_el.text = obj["label"]
-                        
-                        # stReg:Type (e.g. Face)
-                        # Default to "Face" per user request example, or verify via logic.
-                        # Since we don't store type, we'll hardcode "Face" or map if possible.
-                        # User example says "Subject A", Type "Face".
-                        type_el = ET.SubElement(li, f"{{{NS_MAP['stReg']}}}Type")
-                        type_el.text = "Face" 
+                    # Convert to Center
+                    cx = bbox['xmin'] + (bbox['width'] / 2.0)
+                    cy = bbox['ymin'] + (bbox['height'] / 2.0)
+                    
+                    area.set(f"{{{NS_MAP['stArea']}}}x", f"{cx:.6f}")
+                    area.set(f"{{{NS_MAP['stArea']}}}y", f"{cy:.6f}")
+                    area.set(f"{{{NS_MAP['stArea']}}}w", f"{bbox['width']:.6f}")
+                    area.set(f"{{{NS_MAP['stArea']}}}h", f"{bbox['height']:.6f}")
+                    area.set(f"{{{NS_MAP['stArea']}}}unit", "normalized")
 
-                        # stReg:Area
-                        bbox = obj["bbox"]
-                        area = ET.SubElement(li, f"{{{NS_MAP['stReg']}}}Area")
-                        area.set(f"{{{NS_MAP['rdf']}}}parseType", "Resource")
-                        
-                        # Convert Top-Left (xmin, ymin, w, h) to Center (x, y, w, h)
-                        # bbox is relative 0-1
-                        cx = bbox['xmin'] + (bbox['width'] / 2.0)
-                        cy = bbox['ymin'] + (bbox['height'] / 2.0)
-                        
-                        def add_area_field(name, val):
-                            e = ET.SubElement(area, f"{{{NS_MAP['stArea']}}}{name}")
-                            e.text = f"{val:.6f}"
-                        
-                        add_area_field("x", cx)
-                        add_area_field("y", cy)
-                        add_area_field("w", bbox['width'])
-                        add_area_field("h", bbox['height'])
-                        
-                        unit_el = ET.SubElement(area, f"{{{NS_MAP['stArea']}}}unit")
-                        unit_el.text = "normalized"
+            # Serialize
+            new_xml = ET.tostring(root, encoding='utf-8').decode('utf-8')
+            
+            # Ensure xpacket wrapper if missing (helps with some pyexiv2 init cases)
+            if "<?xpacket" not in new_xml:
+                new_xml = '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n' + new_xml + '\n<?xpacket end="w"?>'
 
-                # Serialize back
-                ET.register_namespace("x", NS_MAP["x"])
-                ET.register_namespace("rdf", NS_MAP["rdf"])
-                ET.register_namespace("dc", NS_MAP["dc"])
-                ET.register_namespace("mwg-rs", NS_MAP["mwg-rs"])
-                ET.register_namespace("stDim", NS_MAP["stDim"])
-                ET.register_namespace("stArea", NS_MAP["stArea"])
-                ET.register_namespace("stReg", NS_MAP["stReg"])
-
-                new_xml = ET.tostring(root, encoding='utf-8').decode('utf-8')
-                
-                # Verify and cleanup XML declaration if needed
-                # (ET might add <?xml ...?> which is valid but sometimes XMP packets don't want it inside the packet wrapper)
-                # But tostring usually doesn't add it unless requested.
-                
-                img.modify_raw_xmp(new_xml)
-                
-            except Exception as e:
-                print(f"XML parsing error: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback to simple subject modification if XML fails
-                img.modify_xmp({"Xmp.dc.subject": labels})
+            # Apply to image with retry logic
+            attempts = 2
+            for i in range(attempts):
+                try:
+                    # On retry, we might need a fresh handle if the previous one is in a weird state
+                    if i > 0:
+                        # Close and re-open is tricky inside 'with' block context manager logic
+                        # But img is already open. modify_raw_xmp updates in place in memory.
+                        # If it failed, it might have cleared the buffer.
+                        pass
+                        
+                    img.modify_raw_xmp(new_xml)
+                    break # Success
+                except Exception as e:
+                    if i == attempts - 1:
+                        # Final attempt failed
+                        print(f"XMP Write final failure: {e}")
+                        raise e
+                    else:
+                        print(f"XMP Write attempt {i+1} failed: {e}. Retrying...")
+                        # Small delay or no-op, just retry
+                        import time
+                        time.sleep(0.1)
